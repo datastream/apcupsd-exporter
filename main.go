@@ -27,12 +27,17 @@ type upsInfo struct {
 	timeLeft         time.Duration
 	cumTimeOnBattery time.Duration
 
+	lastTransOnBattery  time.Duration
+	lastTransOffBattery time.Duration
+	selfTest            time.Duration
+
 	loadPercent float64
 
 	batteryVoltage    float64
 	lineVoltage       float64
 	nomBatteryVoltage float64
 	nomInputVoltage   float64
+	transNumber       float64
 
 	hostname string
 	upsName  string
@@ -148,6 +153,30 @@ var (
 	},
 		labels,
 	)
+	transNumber = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "apcups_battery_number_transfers_total",
+		Help: "UPS transfer number count",
+	},
+		labels,
+	)
+	xonBatt = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "apcups_last_transfer_on_battery",
+		Help: "UPS last transfer on battery time",
+	},
+		labels,
+	)
+	xoffBatt = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "apcups_last_transfer_off_battery",
+		Help: "UPS last transfer off battery time",
+	},
+		labels,
+	)
+	selfBatteryTest = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "apcups_last_selftest",
+		Help: "UPS last selftest time",
+	},
+		labels,
+	)
 )
 
 func main() {
@@ -173,10 +202,14 @@ func main() {
 	prometheus.MustRegister(nomBatteryVoltage)
 	prometheus.MustRegister(nomInputVoltage)
 	prometheus.MustRegister(collectSeconds)
+	prometheus.MustRegister(transNumber)
+	prometheus.MustRegister(xonBatt)
+	prometheus.MustRegister(xoffBatt)
+	prometheus.MustRegister(selfBatteryTest)
 
 	go func() {
 		c := time.Tick(10 * time.Second)
-		for _ = range c {
+		for range c {
 			if err := collectUPSData(upsAddr); err != nil {
 				log.Printf("Error collecting UPS data: %+v", err)
 			}
@@ -232,6 +265,11 @@ func collectUPSData(upsAddr *string) error {
 	nomBatteryVoltage.WithLabelValues(info.hostname, info.upsName).Set(info.nomBatteryVoltage)
 	nomInputVoltage.WithLabelValues(info.hostname, info.upsName).Set(info.nomInputVoltage)
 
+	transNumber.WithLabelValues(info.hostname, info.upsName).Set(info.transNumber)
+	xonBatt.WithLabelValues(info.hostname, info.upsName).Set(info.lastTransOnBattery.Seconds())
+	xoffBatt.WithLabelValues(info.hostname, info.upsName).Set(info.lastTransOffBattery.Seconds())
+	selfBatteryTest.WithLabelValues(info.hostname, info.upsName).Set(info.selfTest.Seconds())
+
 	return nil
 }
 
@@ -253,22 +291,40 @@ func transformData(ups map[string]string) (*upsInfo, error) {
 		upsInfo.batteryChargePercent = chargePercent
 	}
 
-	if time, err := parseTime(ups["TONBATT"]); err != nil {
+	if costtime, err := parseTime(ups["TONBATT"]); err != nil {
 		return nil, err
 	} else {
-		upsInfo.timeOnBattery = time
+		upsInfo.timeOnBattery = costtime
 	}
 
-	if time, err := parseTime(ups["TIMELEFT"]); err != nil {
+	if costtime, err := parseLocalTime(ups["XOFFBATT"]); err != nil {
 		return nil, err
 	} else {
-		upsInfo.timeLeft = time
+		upsInfo.lastTransOffBattery = costtime
 	}
 
-	if time, err := parseTime(ups["CUMONBATT"]); err != nil {
+	if costtime, err := parseLocalTime(ups["XONBATT"]); err != nil {
 		return nil, err
 	} else {
-		upsInfo.cumTimeOnBattery = time
+		upsInfo.lastTransOnBattery = costtime
+	}
+
+	if lasttime, err := parseTime(ups["SELFTEST"]); err != nil {
+		return nil, err
+	} else {
+		upsInfo.selfTest = lasttime
+	}
+
+	if costtime, err := parseTime(ups["TIMELEFT"]); err != nil {
+		return nil, err
+	} else {
+		upsInfo.timeLeft = costtime
+	}
+
+	if costtime, err := parseTime(ups["CUMONBATT"]); err != nil {
+		return nil, err
+	} else {
+		upsInfo.cumTimeOnBattery = costtime
 	}
 
 	if percent, err := parseUnits(ups["LOADPCT"]); err != nil {
@@ -301,6 +357,12 @@ func transformData(ups map[string]string) (*upsInfo, error) {
 		upsInfo.nomInputVoltage = volts
 	}
 
+	if num, err := parseUnits(ups["NUMXFERS"]); err != nil {
+		return nil, err
+	} else {
+		upsInfo.transNumber = num
+	}
+
 	upsInfo.hostname = ups["HOSTNAME"]
 	upsInfo.upsName = ups["UPSNAME"]
 
@@ -309,17 +371,39 @@ func transformData(ups map[string]string) (*upsInfo, error) {
 
 // parse time strings like 30 seconds or 1.25 minutes
 func parseTime(t string) (time.Duration, error) {
-	if t == ""{
+	if t == "" {
 		return 0, nil
 	}
 	chunks := strings.Split(t, " ")
+	if len(chunks) < 2 {
+		return 0, nil
+	}
 	fmtStr := chunks[0] + string(strings.ToLower(chunks[1])[0])
 	return time.ParseDuration(fmtStr)
 }
 
+func parseLocalTime(t string) (time.Duration, error) {
+	fmt.Println(t)
+	if t == "" {
+		return 0, nil
+	}
+	chunks := strings.Split(t, " ")
+	if len(chunks) < 3 {
+		return 0, nil
+	}
+	if len(chunks[2]) > 4 {
+		t = fmt.Sprintf("%sT%s%s:%s", chunks[0], chunks[1], chunks[2][:3], chunks[2][3:])
+	} else {
+		t = fmt.Sprintf("%sT%s+08:00", chunks[0], chunks[1])
+	}
+	currentTime, err := time.Parse(time.RFC3339, t)
+	fmt.Println(t, currentTime)
+	return time.Duration(currentTime.UnixNano()), err
+}
+
 // parse generic units, splitting of units name and converting to float
 func parseUnits(v string) (float64, error) {
-	if v == ""{
+	if v == "" {
 		return 0, nil
 	}
 	return strconv.ParseFloat(strings.Split(v, " ")[0], 32)
@@ -360,7 +444,11 @@ func retrieveData(hostPort string) (map[string]string, error) {
 				log.Panicf("Error reading size from incoming reader: %+v", err)
 			}
 			chunks := strings.Split(string(data), ":")
-			upsData[strings.TrimSpace(chunks[0])] = strings.TrimSpace(chunks[1])
+			if len(chunks) > 2 {
+				upsData[strings.TrimSpace(chunks[0])] = strings.TrimSpace(strings.Join(chunks[1:], ":"))
+			} else {
+				upsData[strings.TrimSpace(chunks[0])] = strings.TrimSpace(chunks[1])
+			}
 
 		} else {
 			complete = true
